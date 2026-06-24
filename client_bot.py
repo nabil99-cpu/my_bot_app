@@ -2,7 +2,7 @@ import os
 import sqlite3
 import logging
 import time
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 from contextlib import contextmanager
@@ -13,6 +13,14 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiException
 from flask import Flask, request, jsonify
+
+from catalog import (
+    get_enabled_networks,
+    get_packages_by_network,
+    get_network,
+    get_package,
+    validate_package_belongs_to_network,
+)
 
 # ============================================================================
 # LOGGING
@@ -58,28 +66,6 @@ class UserState(Enum):
     ORDER_SUBMITTED = "order_submitted"
 
 
-@dataclass(frozen=True)
-class Package:
-    id: str
-    name: str
-    price: int
-    data_gb: str
-    duration_days: int
-
-
-PACKAGES: Dict[str, Package] = {
-    "pkg1": Package("pkg1", "5 جيجا - 7 أيام", 1500, "5", 7),
-    "pkg2": Package("pkg2", "15 جيجا - 30 يوم", 4000, "15", 30),
-    "pkg3": Package("pkg3", "غير محدود - 30 يوم", 8000, "∞", 30),
-}
-
-PAYMENT_INFO = """💳 <b>طرق الدفع:</b>
-1. كريمي: <code>1234 5678 9012 3456</code>
-2. كاش: <code>771234567</code> - أحمد
-3. صرافة القطيبي
-
-📸 <b>بعد التحويل، قم بإرسال صورة الإشعار هنا مباشرة:</b>"""
-
 # ============================================================================
 # DB
 # ============================================================================
@@ -113,6 +99,7 @@ class DatabaseManager:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_states (
                     user_id INTEGER PRIMARY KEY,
+                    selected_network TEXT NOT NULL,
                     selected_package TEXT NOT NULL,
                     state TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -123,7 +110,11 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
+                    network_id TEXT NOT NULL,
+                    network_name TEXT NOT NULL,
                     package_id TEXT NOT NULL,
+                    package_name TEXT NOT NULL,
+                    price INTEGER NOT NULL,
                     image_url TEXT,
                     status TEXT DEFAULT 'pending',
                     admin_response TEXT,
@@ -132,35 +123,64 @@ class DatabaseManager:
             """)
         logger.info("Database initialized")
 
-    def update_user_state(self, user_id: int, package_key: str, state: UserState):
+    def update_user_state(self, user_id: int, network_id: str, package_id: str, state: UserState):
         with self.get_connection() as conn:
             conn.execute("""
-                INSERT INTO user_states (user_id, selected_package, state, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO user_states (user_id, selected_network, selected_package, state, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id) DO UPDATE SET
+                    selected_network=excluded.selected_network,
                     selected_package=excluded.selected_package,
                     state=excluded.state,
                     updated_at=CURRENT_TIMESTAMP
-            """, (user_id, package_key, state.value))
+            """, (user_id, network_id, package_id, state.value))
 
-    def get_user_state(self, user_id: int) -> Optional[Tuple[str, str]]:
+    def get_user_state(self, user_id: int) -> Optional[Dict[str, str]]:
         with self.get_connection() as conn:
-            row = conn.execute(
-                "SELECT selected_package, state FROM user_states WHERE user_id = ?",
-                (user_id,)
-            ).fetchone()
-            return (row["selected_package"], row["state"]) if row else None
+            row = conn.execute("""
+                SELECT selected_network, selected_package, state
+                FROM user_states
+                WHERE user_id = ?
+            """, (user_id,)).fetchone()
+
+            if not row:
+                return None
+
+            return {
+                "network_id": row["selected_network"],
+                "package_id": row["selected_package"],
+                "state": row["state"]
+            }
 
     def clear_user_state(self, user_id: int):
         with self.get_connection() as conn:
             conn.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
 
-    def save_order(self, user_id: int, package_id: str, image_url: str, status: str, admin_response: str = ""):
+    def save_order(
+        self,
+        user_id: int,
+        network_id: str,
+        network_name: str,
+        package_id: str,
+        package_name: str,
+        price: int,
+        image_url: str,
+        status: str,
+        admin_response: str = ""
+    ):
         with self.get_connection() as conn:
             conn.execute("""
-                INSERT INTO orders (user_id, package_id, image_url, status, admin_response)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, package_id, image_url, status, admin_response))
+                INSERT INTO orders (
+                    user_id, network_id, network_name,
+                    package_id, package_name, price,
+                    image_url, status, admin_response
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user_id, network_id, network_name,
+                package_id, package_name, price,
+                image_url, status, admin_response
+            ))
 
 
 db = DatabaseManager(DB_PATH)
@@ -175,16 +195,22 @@ class AdminAPIClient:
         self.timeout = timeout
         self.session = requests.Session()
 
-    def submit_order(self, user_id: int, package: Package, user_info: Dict[str, Any], image_url: str):
+    def submit_order(self, user_id: int, network, package, user_info: Dict[str, Any], image_url: str):
         payload = {
             "client_id": user_id,
             "name": user_info.get("first_name") or "User",
             "username": user_info.get("username") or "No Username",
+
+            "network_id": network.id,
+            "network_name": network.display_name,
+
+            "package_id": package.id,
             "package": package.name,
             "price": package.price,
-            "image_url": image_url,
             "data_gb": package.data_gb,
             "duration_days": package.duration_days,
+
+            "image_url": image_url,
         }
 
         try:
@@ -194,6 +220,7 @@ class AdminAPIClient:
                 timeout=self.timeout
             )
             text_preview = response.text[:500] if response.text else ""
+
             if 200 <= response.status_code < 300:
                 return True, text_preview
 
@@ -241,19 +268,49 @@ def ensure_webhook():
 # BOT HELPERS
 # ============================================================================
 
-def build_packages_markup():
+def build_networks_markup():
     markup = InlineKeyboardMarkup()
-    for key, pkg in PACKAGES.items():
-        markup.add(InlineKeyboardButton(f"{pkg.name} - {pkg.price} ريال", callback_data=key))
+    for network in get_enabled_networks():
+        markup.add(
+            InlineKeyboardButton(
+                network.display_name,
+                callback_data=f"network:{network.id}"
+            )
+        )
     return markup
 
-def process_order_async(user_id, pkg_key, pkg, message, processing_msg, image_url, user_info):
+def build_packages_markup(network_id: str):
+    markup = InlineKeyboardMarkup()
+    packages = get_packages_by_network(network_id)
+
+    for pkg in packages:
+        markup.add(
+            InlineKeyboardButton(
+                f"{pkg.name} - {pkg.price} ريال",
+                callback_data=f"package:{network_id}:{pkg.id}"
+            )
+        )
+
+    markup.add(InlineKeyboardButton("⬅️ رجوع للشبكات", callback_data="back:networks"))
+    return markup
+
+def process_order_async(user_id, network, package, message, processing_msg, image_url, user_info):
     try:
-        ok, admin_response = admin_api.submit_order(user_id, pkg, user_info, image_url)
+        ok, admin_response = admin_api.submit_order(user_id, network, package, user_info, image_url)
 
         if ok:
-            db.save_order(user_id, pkg_key, image_url, "submitted", admin_response)
-            db.update_user_state(user_id, pkg_key, UserState.ORDER_SUBMITTED)
+            db.save_order(
+                user_id=user_id,
+                network_id=network.id,
+                network_name=network.display_name,
+                package_id=package.id,
+                package_name=package.name,
+                price=package.price,
+                image_url=image_url,
+                status="submitted",
+                admin_response=admin_response
+            )
+            db.update_user_state(user_id, network.id, package.id, UserState.ORDER_SUBMITTED)
 
             bot.edit_message_text(
                 "✅ تم استلام الإشعار وإرساله للإدارة بنجاح.\n\n"
@@ -263,9 +320,20 @@ def process_order_async(user_id, pkg_key, pkg, message, processing_msg, image_ur
             )
             db.clear_user_state(user_id)
         else:
-            db.save_order(user_id, pkg_key, image_url, "failed", admin_response)
+            db.save_order(
+                user_id=user_id,
+                network_id=network.id,
+                network_name=network.display_name,
+                package_id=package.id,
+                package_name=package.name,
+                price=package.price,
+                image_url=image_url,
+                status="failed",
+                admin_response=admin_response
+            )
             bot.edit_message_text(
-                "❌ حدث خطأ أثناء إرسال طلبك للإدارة.\nالرجاء المحاولة لاحقاً أو مراسلة الدعم.",
+                "❌ حدث خطأ أثناء إرسال طلبك للإدارة.\n"
+                "الرجاء المحاولة لاحقاً أو مراسلة الدعم.",
                 chat_id=message.chat.id,
                 message_id=processing_msg.message_id
             )
@@ -290,28 +358,78 @@ def handle_start(message):
     try:
         bot.send_message(
             message.chat.id,
-            "أهلاً بك في شبكتنا 🌐\nالرجاء اختيار الباقة المناسبة لك:",
-            reply_markup=build_packages_markup()
+            "أهلاً بك في شبكتنا 🌐\nاختر الشبكة أولاً:",
+            reply_markup=build_networks_markup()
         )
     except Exception:
         logger.exception("Error in /start")
-        bot.reply_to(message, "❌ حدث خطأ أثناء عرض الباقات.")
+        bot.reply_to(message, "❌ حدث خطأ أثناء عرض الشبكات.")
 
-@bot.callback_query_handler(func=lambda call: call.data in PACKAGES)
+@bot.callback_query_handler(func=lambda call: call.data == "back:networks")
+def handle_back_to_networks(call):
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="أهلاً بك في شبكتنا 🌐\nاختر الشبكة أولاً:",
+            reply_markup=build_networks_markup()
+        )
+        bot.answer_callback_query(call.id, "تم الرجوع للشبكات")
+    except Exception:
+        logger.exception("Error in back to networks")
+        bot.answer_callback_query(call.id, "❌ حدث خطأ", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("network:"))
+def handle_network_selection(call):
+    try:
+        _, network_id = call.data.split(":", 1)
+        network = get_network(network_id)
+
+        if not network or not network.enabled:
+            bot.answer_callback_query(call.id, "❌ الشبكة غير متاحة", show_alert=True)
+            return
+
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=f"📡 <b>{network.display_name}</b>\nاختر الباقة المناسبة:",
+            reply_markup=build_packages_markup(network_id)
+        )
+        bot.answer_callback_query(call.id, "تم اختيار الشبكة")
+    except Exception:
+        logger.exception("Error in network selection")
+        bot.answer_callback_query(call.id, "❌ حدث خطأ", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("package:"))
 def handle_package_selection(call):
     try:
-        pkg_key = call.data
-        pkg = PACKAGES[pkg_key]
-        user_id = call.from_user.id
+        _, network_id, package_id = call.data.split(":", 2)
 
-        db.update_user_state(user_id, pkg_key, UserState.WAITING_FOR_PAYMENT)
+        network = get_network(network_id)
+        package = get_package(package_id)
+
+        if not network or not network.enabled:
+            bot.answer_callback_query(call.id, "❌ الشبكة غير موجودة", show_alert=True)
+            return
+
+        if not package or not package.enabled:
+            bot.answer_callback_query(call.id, "❌ الباقة غير موجودة", show_alert=True)
+            return
+
+        if not validate_package_belongs_to_network(network_id, package_id):
+            bot.answer_callback_query(call.id, "❌ الباقة لا تنتمي لهذه الشبكة", show_alert=True)
+            return
+
+        user_id = call.from_user.id
+        db.update_user_state(user_id, network_id, package_id, UserState.WAITING_FOR_PAYMENT)
 
         text = (
-            f"📦 طلبت: <b>{pkg.name}</b>\n"
-            f"💰 المبلغ: <b>{pkg.price} ريال</b>\n"
-            f"💾 البيانات: <b>{pkg.data_gb} جيجا</b>\n"
-            f"📅 المدة: <b>{pkg.duration_days} يوم</b>\n\n"
-            f"{PAYMENT_INFO}"
+            f"📡 <b>الشبكة:</b> {network.display_name}\n"
+            f"📦 <b>الباقة:</b> {package.name}\n"
+            f"💰 <b>السعر:</b> {package.price} ريال\n"
+            f"💾 <b>البيانات:</b> {package.data_gb} جيجا\n"
+            f"📅 <b>المدة:</b> {package.duration_days} يوم\n\n"
+            f"{network.payment_info}"
         )
 
         bot.edit_message_text(
@@ -330,15 +448,24 @@ def handle_payment_proof(message):
 
     try:
         state_data = db.get_user_state(user_id)
-        if not state_data or state_data[1] != UserState.WAITING_FOR_PAYMENT.value:
-            bot.reply_to(message, "⚠️ الرجاء إرسال /start واختيار الباقة أولاً قبل إرسال الإشعار.")
+        if not state_data or state_data["state"] != UserState.WAITING_FOR_PAYMENT.value:
+            bot.reply_to(message, "⚠️ الرجاء إرسال /start واختيار الشبكة ثم الباقة أولاً قبل إرسال الإشعار.")
             return
 
-        pkg_key = state_data[0]
-        pkg = PACKAGES.get(pkg_key)
-        if not pkg:
+        network_id = state_data["network_id"]
+        package_id = state_data["package_id"]
+
+        network = get_network(network_id)
+        package = get_package(package_id)
+
+        if not network or not package:
             db.clear_user_state(user_id)
-            bot.reply_to(message, "❌ الباقة غير موجودة. أرسل /start من جديد.")
+            bot.reply_to(message, "❌ تعذر العثور على الشبكة أو الباقة. أرسل /start من جديد.")
+            return
+
+        if not validate_package_belongs_to_network(network_id, package_id):
+            db.clear_user_state(user_id)
+            bot.reply_to(message, "❌ الباقة لا تنتمي للشبكة المحددة. أرسل /start من جديد.")
             return
 
         processing_msg = bot.reply_to(message, "⏳ جاري معالجة الإشعار وإرساله للإدارة...")
@@ -353,7 +480,7 @@ def handle_payment_proof(message):
 
         executor.submit(
             process_order_async,
-            user_id, pkg_key, pkg, message, processing_msg, image_url, user_info
+            user_id, network, package, message, processing_msg, image_url, user_info
         )
 
     except ApiException:
@@ -365,7 +492,7 @@ def handle_payment_proof(message):
 
 @bot.message_handler(func=lambda message: True)
 def handle_default_message(message):
-    bot.reply_to(message, "أرسل /start للبدء باختيار الباقة.")
+    bot.reply_to(message, "أرسل /start للبدء واختيار الشبكة ثم الباقة.")
 
 # ============================================================================
 # FLASK ROUTES
