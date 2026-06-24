@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: client-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT client_bot:app
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_BOT_URL
+        sync: false
+      - key: WEBHOOK_SECRET_TOKEN
+        sync: false
+      - key: DB_PATH
+        value: client_bot.db
+      - key: REQUEST_TIMEOUT
+        value: "15"
+      - key: MAX_WORKERS
+        value: "8"
+
+  - type: web
+    name: admin-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT admin_bot:app
+    envVars:
+      - key: ADMIN_BOT_TOKEN
+        sync: false
+      - key: CLIENT_BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: WEBHOOK_SECRET_TOKEN
+        sync: false
+      - key: REQUEST_TIMEOUT
+        value: "15"
